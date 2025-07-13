@@ -6,38 +6,15 @@ defmodule Asciinema.Streaming do
 
   defdelegate recording_mode, to: StreamServer
 
-  def find_stream_by_producer_token(token) do
-    Repo.get_by(Stream, producer_token: token)
+  def find_live_stream_by_producer_token(token) do
+    from(s in Stream, where: s.live and s.producer_token == ^token)
+    |> Repo.one()
   end
 
   def get_stream(id) do
     Stream
     |> Repo.get(id)
     |> Repo.preload(:user)
-  end
-
-  def get_stream(%{streams: _} = owner, id) do
-    owner
-    |> Ecto.assoc(:streams)
-    |> where([s], like(s.public_token, ^"#{id}%"))
-    |> first()
-    |> Repo.one()
-  end
-
-  def fetch_stream(owner, id), do: OK.required(get_stream(owner, id), :not_found)
-
-  def fetch_default_stream(%{streams: _} = owner) do
-    streams =
-      owner
-      |> Ecto.assoc(:streams)
-      |> limit(2)
-      |> Repo.all()
-
-    case streams do
-      [] -> {:error, :not_found}
-      [stream] -> {:ok, stream}
-      _ -> {:error, :too_many}
-    end
   end
 
   def find_stream_by_public_token(token) do
@@ -57,6 +34,18 @@ defmodule Asciinema.Streaming do
       true ->
         nil
     end
+  end
+
+  # TODO: remove after release of the final CLI 3.0
+  def find_user_stream_by_public_token(%{streams: _} = owner, prefix) do
+    prefix = String.replace(prefix, "%", "")
+
+    owner
+    |> Ecto.assoc(:streams)
+    |> where([s], like(s.public_token, ^"#{prefix}%"))
+    |> first()
+    |> Repo.one()
+    |> Repo.preload(:user)
   end
 
   def query(filters \\ [], order \\ nil) do
@@ -83,19 +72,69 @@ defmodule Asciinema.Streaming do
 
       :live ->
         where(q, [s], s.live)
+
+      {:prefix, nil} ->
+        q
+
+      {:prefix, prefix} ->
+        prefix = String.replace(prefix, "%", "")
+        where(q, [s], like(s.public_token, ^"#{prefix}%"))
     end
   end
 
-  defp sort(q, nil), do: q
+  defp sort(q, order) do
+    case order do
+      nil ->
+        q
 
-  defp sort(q, :activity) do
-    order_by(q, desc: :live, desc_nulls_last: :last_started_at, desc: :id)
+      :activity ->
+        order_by(q, desc: :live, desc_nulls_last: :last_started_at, desc: :id)
+
+      :id ->
+        order_by(q, asc: :id)
+    end
   end
 
   def paginate(%Ecto.Query{} = query, page, page_size) do
     query
     |> preload(:user)
     |> Repo.paginate(page: page, page_size: page_size)
+  end
+
+  def cursor_paginate(query, last_id \\ nil, limit \\ 10)
+
+  def cursor_paginate(%Ecto.Query{} = query, nil, limit) do
+    do_cursor_paginate(query, limit)
+  end
+
+  def cursor_paginate(%Ecto.Query{} = query, last_id, limit) do
+    query
+    |> where([s], s.id > ^last_id)
+    |> do_cursor_paginate(limit)
+  end
+
+  defp do_cursor_paginate(query, limit) do
+    limit = min(limit, 100)
+
+    query =
+      query
+      |> limit(^(limit + 1))
+      |> preload(:user)
+
+    entries = Repo.all(query)
+
+    case entries do
+      [] ->
+        %{entries: [], has_more: false, last_id: nil}
+
+      entries when length(entries) <= limit ->
+        %{entries: entries, has_more: false, last_id: nil}
+
+      entries ->
+        {results, _} = Enum.split(entries, limit)
+        last_id = List.last(results).id
+        %{entries: results, has_more: true, last_id: last_id}
+    end
   end
 
   def list(q, limit \\ nil)
@@ -113,7 +152,7 @@ defmodule Asciinema.Streaming do
     |> Repo.all()
   end
 
-  def create_stream!(user) do
+  def create_stream(user, params \\ %{}) do
     %Stream{}
     |> change(
       public_token: generate_public_token(),
@@ -122,24 +161,16 @@ defmodule Asciinema.Streaming do
       term_theme_prefer_original: user.term_theme_prefer_original
     )
     |> put_assoc(:user, user)
-    |> Repo.insert!()
+    |> change_stream(params)
+    |> Repo.insert()
   end
-
-  def create_stream(user) do
-    if user.stream_limit == nil or count_streams(user) < user.stream_limit do
-      {:ok, create_stream!(user)}
-    else
-      {:error, :limit_reached}
-    end
-  end
-
-  defp count_streams(user), do: Repo.count(Ecto.assoc(user, :streams))
 
   def change_stream(stream, attrs \\ %{})
 
   def change_stream(stream, attrs) when is_map(attrs) do
     stream
     |> cast(attrs, [
+      :live,
       :title,
       :description,
       :visibility,
@@ -160,6 +191,7 @@ defmodule Asciinema.Streaming do
     )
     |> validate_inclusion(:term_font_family, Fonts.terminal_font_families())
     |> validate_format(:audio_url, ~r|^https?://|)
+    |> check_constraint(:live, name: "live_stream_limit")
   end
 
   def update_stream(stream, attrs) when is_list(attrs) do
@@ -190,7 +222,7 @@ defmodule Asciinema.Streaming do
   defp change_last_activity(changeset) do
     case fetch_field!(changeset, :live) do
       true ->
-        cast(changeset, %{last_activity_at: Timex.now()}, [:last_activity_at])
+        change(changeset, %{last_activity_at: DateTime.utc_now(:second)})
 
       false ->
         changeset
@@ -212,7 +244,11 @@ defmodule Asciinema.Streaming do
 
   def mark_inactive_streams_offline do
     t = Timex.shift(Timex.now(), minutes: -1)
-    q = from(s in Stream, where: s.live and s.last_activity_at < ^t)
+
+    q =
+      from(s in Stream,
+        where: s.live and fragment("COALESCE(last_activity_at, inserted_at) < ?", ^t)
+      )
 
     {count, _} = Repo.update_all(q, set: [live: false, current_viewer_count: 0])
 

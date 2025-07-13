@@ -3,6 +3,12 @@ defmodule AsciinemaWeb.Api.StreamJSON do
   alias AsciinemaWeb.UrlHelpers
   alias Ecto.Changeset
 
+  def index(%{streams: streams}) do
+    for stream <- streams do
+      show(%{stream: stream})
+    end
+  end
+
   def show(%{stream: stream}) do
     url = url(~p"/s/#{stream}")
     ws_producer_url = UrlHelpers.ws_producer_url(stream)
@@ -12,6 +18,7 @@ defmodule AsciinemaWeb.Api.StreamJSON do
       url: url,
       ws_producer_url: ws_producer_url,
       audio_url: stream.audio_url,
+      live: stream.live,
       title: stream.title,
       description: stream.description,
       visibility: stream.visibility
@@ -19,6 +26,10 @@ defmodule AsciinemaWeb.Api.StreamJSON do
   end
 
   def deleted(_assigns), do: %{}
+
+  def error(%{reason: %Changeset{errors: [{:live, _}]}}) do
+    error(%{reason: "live stream limit exceeded"})
+  end
 
   def error(%{reason: %Changeset{} = changeset}) do
     %{errors: translate_errors(changeset)}
