@@ -3,6 +3,7 @@ defmodule Asciinema.Streaming do
   import Ecto.Query
   alias Asciinema.{Fonts, Repo}
   alias Asciinema.Streaming.{Stream, StreamServer}
+  alias Ecto.Changeset
 
   defdelegate recording_mode, to: StreamServer
 
@@ -152,6 +153,14 @@ defmodule Asciinema.Streaming do
     |> Repo.all()
   end
 
+  @doc """
+  Creates a new stream for the given user.
+
+  Live stream limiting is enforced at the database level via a PostgreSQL trigger
+  (`enforce_live_stream_limit`) to prevent race conditions during concurrent
+  stream creation. The trigger locks the user row and counts existing live streams
+  before allowing a new live stream to be created.
+  """
   def create_stream(user, params \\ %{}) do
     %Stream{}
     |> change(
@@ -163,6 +172,20 @@ defmodule Asciinema.Streaming do
     |> put_assoc(:user, user)
     |> change_stream(params)
     |> Repo.insert()
+    |> convert_live_limit_error(user.live_stream_limit)
+  end
+
+  defp convert_live_limit_error(result, live_stream_limit) do
+    case result do
+      {:ok, stream} ->
+        {:ok, stream}
+
+      {:error, %Changeset{errors: [{:live, _}]}} ->
+        {:error, {:live_stream_limit_reached, live_stream_limit}}
+
+      {:error, changeset} ->
+        {:error, changeset}
+    end
   end
 
   def change_stream(stream, attrs \\ %{})
@@ -202,10 +225,19 @@ defmodule Asciinema.Streaming do
     |> Repo.update!()
   end
 
+  @doc """
+  Updates an existing stream with the given attributes.
+
+  When setting `live: true`, the PostgreSQL trigger
+  (`enforce_live_stream_limit`) will enforce the user's live stream limit to
+  prevent race conditions. The trigger uses row-level locking to ensure
+  atomicity during concurrent updates.
+  """
   def update_stream(stream, attrs) when is_map(attrs) do
     stream
     |> change_stream(attrs)
     |> Repo.update()
+    |> convert_live_limit_error(stream.user.live_stream_limit)
   end
 
   defp update_peak_viewer_count(changeset) do

@@ -7,7 +7,10 @@ defmodule AsciinemaWeb.RecordingController do
   alias AsciinemaWeb.FallbackController
 
   plug :require_current_user when action in [:edit, :update, :delete]
-  plug :load_and_authorize_asciicast when action in [:show, :edit, :update, :delete, :iframe, :example]
+
+  plug :load_and_authorize_asciicast
+       when action in [:show, :edit, :update, :delete, :iframe, :example]
+
   plug :redirect_to_canonical_path when action == :show
 
   def index(conn, params) do
